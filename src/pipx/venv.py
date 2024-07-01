@@ -10,7 +10,7 @@ from typing import Dict, Generator, List, NoReturn, Optional, Set
 try:
     from importlib.metadata import Distribution, EntryPoint
 except ImportError:
-    from importlib_metadata import Distribution, EntryPoint  # type: ignore
+    from importlib_metadata import Distribution, EntryPoint  # type: ignore[import-not-found,no-redef]
 
 from packaging.utils import canonicalize_name
 
@@ -262,7 +262,7 @@ class Venv:
         if pip_process.returncode:
             raise PipxError(f"Error installing {full_package_description(package_name, package_or_url)}.")
 
-        self._update_package_metadata(
+        self.update_package_metadata(
             package_name=package_name,
             package_or_url=package_or_url,
             pip_args=pip_args,
@@ -349,7 +349,7 @@ class Venv:
         logger.info(f"get_venv_metadata_for_package: {1e3*(time.time()-data_start):.0f}ms")
         return venv_metadata
 
-    def _update_package_metadata(
+    def update_package_metadata(
         self,
         package_name: str,
         package_or_url: str,
@@ -358,6 +358,7 @@ class Venv:
         include_apps: bool,
         is_main_package: bool,
         suffix: str = "",
+        pinned: bool = False,
     ) -> None:
         venv_package_metadata = self.get_venv_metadata_for_package(package_name, get_extras(package_or_url))
         package_info = PackageInfo(
@@ -376,6 +377,7 @@ class Venv:
             man_paths_of_dependencies=venv_package_metadata.man_paths_of_dependencies,
             package_version=venv_package_metadata.package_version,
             suffix=suffix,
+            pinned=pinned,
         )
         if is_main_package:
             self.pipx_metadata.main_package = package_info
@@ -400,8 +402,13 @@ class Venv:
         dists = Distribution.discover(name=self.main_package_name, path=[str(get_site_packages(self.python_path))])
         for dist in dists:
             for ep in dist.entry_points:
-                if ep.group == "pipx.run" and ep.name == app:
-                    return ep
+                if ep.group == "pipx.run":
+                    if ep.name == app:
+                        return ep
+                    # Try to infer app name from dist's metadata if given
+                    # local path
+                    if Path(app).exists() and dist.metadata["Name"] == ep.name:
+                        return ep
         return None
 
     def run_app(self, app: str, filename: str, app_args: List[str]) -> NoReturn:
@@ -416,6 +423,7 @@ class Venv:
         # "entry_point.module" and "entry_point.attr" instead.
         match = _entry_point_value_pattern.match(entry_point.value)
         assert match is not None, "invalid entry point"
+        logger.info("Using discovered entry point for 'pipx run'")
         module, attr = match.group("module", "attr")
         code = f"import sys, {module}\nsys.argv[0] = {entry_point.name!r}\nsys.exit({module}.{attr}())\n"
         exec_app([str(self.python_path), "-c", code] + app_args)
@@ -449,7 +457,7 @@ class Venv:
             pip_process = self._run_pip(["--no-input", "install"] + pip_args + ["--upgrade", package_or_url])
         subprocess_post_check(pip_process)
 
-        self._update_package_metadata(
+        self.update_package_metadata(
             package_name=package_name,
             package_or_url=package_or_url,
             pip_args=pip_args,

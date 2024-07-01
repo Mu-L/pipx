@@ -84,11 +84,12 @@ PIPX_DESCRIPTION = textwrap.dedent(
 PIPX_DESCRIPTION += pipx_wrap(
     """
     optional environment variables:
-      PIPX_HOME             Overrides default pipx location. Virtual Environments will be installed to $PIPX_HOME/venvs.
-      PIPX_BIN_DIR          Overrides location of app installations. Apps are symlinked or copied here.
-      PIPX_MAN_DIR          Overrides location of manual pages installations. Manual pages are symlinked or copied here.
-      PIPX_DEFAULT_PYTHON   Overrides default python used for commands.
-      USE_EMOJI             Overrides emoji behavior. Default value varies based on platform.
+      PIPX_HOME              Overrides default pipx location. Virtual Environments will be installed to $PIPX_HOME/venvs.
+      PIPX_BIN_DIR           Overrides location of app installations. Apps are symlinked or copied here.
+      PIPX_MAN_DIR           Overrides location of manual pages installations. Manual pages are symlinked or copied here.
+      PIPX_DEFAULT_PYTHON    Overrides default python used for commands.
+      USE_EMOJI              Overrides emoji behavior. Default value varies based on platform.
+      PIPX_HOME_ALLOW_SPACE  Overrides default warning on spaces in the home path
     """,
     subsequent_indent=" " * 24,  # match the indent of argparse options
     keep_newlines=True,
@@ -158,7 +159,9 @@ def get_pip_args(parsed_args: Dict[str, str]) -> List[str]:
         pip_args += ["--index-url", parsed_args["index_url"]]
 
     if parsed_args.get("pip_args"):
-        pip_args += shlex.split(parsed_args.get("pip_args", ""), posix=not WINDOWS)
+        # Stripping the single quote that can be parsed from several shells
+        pip_args_striped = parsed_args["pip_args"].strip("'")
+        pip_args += shlex.split(pip_args_striped, posix=not WINDOWS)
 
     # make sure --editable is last because it needs to be right before
     #   package specification
@@ -347,6 +350,7 @@ def run_pipx_command(args: argparse.Namespace, subparsers: Dict[str, argparse.Ar
             args.include_injected,
             args.json,
             args.short,
+            args.pinned,
         )
     elif args.command == "interpreter":
         if args.interpreter_command == "list":
@@ -360,6 +364,10 @@ def run_pipx_command(args: argparse.Namespace, subparsers: Dict[str, argparse.Ar
             return EXIT_CODE_OK
         else:
             raise PipxError(f"Unknown interpreter command {args.interpreter_command}")
+    elif args.command == "pin":
+        return commands.pin(venv_dir, verbose, skip_list, args.injected_only)
+    elif args.command == "unpin":
+        return commands.unpin(venv_dir, verbose)
     elif args.command == "uninstall":
         return commands.uninstall(venv_dir, paths.ctx.bin_dir, paths.ctx.man_dir, verbose)
     elif args.command == "uninstall-all":
@@ -394,7 +402,7 @@ def run_pipx_command(args: argparse.Namespace, subparsers: Dict[str, argparse.Ar
         return commands.run_pip(package, venv_dir, args.pipargs, args.verbose)
     elif args.command == "ensurepath":
         try:
-            return commands.ensure_pipx_paths(force=args.force)
+            return commands.ensure_pipx_paths(prepend=args.prepend, force=args.force)
         except Exception as e:
             logger.debug("Uncaught Exception:", exc_info=True)
             raise PipxError(str(e), wrap_message=False) from None
@@ -579,6 +587,40 @@ def _add_uninject(subparsers, venv_completer: VenvCompleter, shared_parser: argp
     )
 
 
+def _add_pin(subparsers, venv_completer: VenvCompleter, shared_parser: argparse.ArgumentParser) -> None:
+    p = subparsers.add_parser(
+        "pin",
+        help="Pin the specified package to prevent it from being upgraded",
+        description="Pin the specified package to prevent it from being upgraded",
+        parents=[shared_parser],
+    )
+    p.add_argument("package", help="Installed package to pin")
+    p.add_argument(
+        "--injected-only",
+        action="store_true",
+        help=(
+            "Pin injected packages in venv only, so that they will not be upgraded during upgrade operations. "
+            "Note that this should not be passed if you wish to pin both main package and injected packages."
+        ),
+    )
+    p.add_argument(
+        "--skip",
+        nargs="+",
+        default=[],
+        help="Skip these packages. Implies `--injected-only`.",
+    )
+
+
+def _add_unpin(subparsers, venv_completer: VenvCompleter, shared_parser: argparse.ArgumentParser) -> None:
+    p = subparsers.add_parser(
+        "unpin",
+        help="Unpin the specified package",
+        description="Unpin the specified package and all injected packages in its venv to allow them to be upgraded",
+        parents=[shared_parser],
+    )
+    p.add_argument("package", help="Installed package to unpin")
+
+
 def _add_upgrade(subparsers, venv_completer: VenvCompleter, shared_parser: argparse.ArgumentParser) -> None:
     p = subparsers.add_parser(
         "upgrade",
@@ -717,6 +759,11 @@ def _add_list(subparsers: argparse._SubParsersAction, shared_parser: argparse.Ar
     g = p.add_mutually_exclusive_group()
     g.add_argument("--json", action="store_true", help="Output rich data in json format.")
     g.add_argument("--short", action="store_true", help="List packages only.")
+    g.add_argument(
+        "--pinned",
+        action="store_true",
+        help="List pinned packages only. Pass --include-injected at the same time to list injected packages that were pinned.",
+    )
     g.add_argument("--skip-maintenance", action="store_true", help="(deprecated) No-op")
 
 
@@ -831,6 +878,14 @@ def _add_ensurepath(subparsers: argparse._SubParsersAction, shared_parser: argpa
         parents=[shared_parser],
     )
     p.add_argument(
+        "--prepend",
+        action="store_true",
+        help=(
+            "Prepend directories to your PATH instead of appending. "
+            "This is useful if you want to prioritize pipx apps over system apps."
+        ),
+    )
+    p.add_argument(
         "--force",
         "-f",
         action="store_true",
@@ -854,7 +909,7 @@ def _add_environment(subparsers: argparse._SubParsersAction, shared_parser: argp
 
             Available variables:
             PIPX_HOME, PIPX_BIN_DIR, PIPX_MAN_DIR, PIPX_SHARED_LIBS, PIPX_LOCAL_VENVS,
-            PIPX_LOG_DIR, PIPX_TRASH_DIR, PIPX_VENV_CACHEDIR, PIPX_DEFAULT_PYTHON, USE_EMOJI
+            PIPX_LOG_DIR, PIPX_TRASH_DIR, PIPX_VENV_CACHEDIR, PIPX_DEFAULT_PYTHON, USE_EMOJI, PIPX_HOME_ALLOW_SPACE
             """
         ),
         parents=[shared_parser],
@@ -905,7 +960,7 @@ def get_command_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Ar
         description=PIPX_DESCRIPTION,
         parents=[shared_parser],
     )
-    parser.man_short_description = PIPX_DESCRIPTION.splitlines()[1]  # type: ignore
+    parser.man_short_description = PIPX_DESCRIPTION.splitlines()[1]  # type: ignore[attr-defined]
 
     subparsers = parser.add_subparsers(dest="command", description="Get help for commands with pipx COMMAND --help")
 
@@ -914,6 +969,8 @@ def get_command_parser() -> Tuple[argparse.ArgumentParser, Dict[str, argparse.Ar
     _add_install_all(subparsers, shared_parser)
     _add_uninject(subparsers, completer_venvs.use, shared_parser)
     _add_inject(subparsers, completer_venvs.use, shared_parser)
+    _add_pin(subparsers, completer_venvs.use, shared_parser)
+    _add_unpin(subparsers, completer_venvs.use, shared_parser)
     _add_upgrade(subparsers, completer_venvs.use, shared_parser)
     _add_upgrade_all(subparsers, shared_parser)
     _add_upgrade_shared(subparsers, shared_parser)

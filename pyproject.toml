@@ -72,10 +72,12 @@ lint.extend-select = [
   "C9",
   "I",
   "ISC",
+  "PGH",
   "PLC",
   "PLE",
   "PLW",
   "RSE",
+  "RUF012",
   "RUF100",
   "W",
 ]
